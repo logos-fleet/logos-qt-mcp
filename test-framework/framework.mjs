@@ -18,8 +18,9 @@
 //
 // Environment:
 //   QML_INSPECTOR_HOST  (default: localhost)
-//   QML_INSPECTOR_PORT  (no default when the framework launches the app: it
-//                        takes a free port per app -- see below)
+//   QML_INSPECTOR_PORT  (default: 3768 when attaching to an app you started
+//                        yourself; when the framework launches the app it
+//                        takes a free port per app instead -- see below)
 // ---------------------------------------------------------------------------
 
 import net from "node:net";
@@ -27,32 +28,27 @@ import { spawn } from "node:child_process";
 
 const HOST = process.env.QML_INSPECTOR_HOST || "localhost";
 
-// The inspector port is a VARIABLE, not a constant. 3768 stays the default for
-// a human attaching to an app they started by hand, but a suite that launches
-// its OWN app takes a free port instead, because several such suites run at
-// once: nix builds independent checks in parallel, and one machine hosts
-// several agents.
-//
-// Two apps on one fixed port do not fail loudly. The loser's listen() fails
-// with EADDRINUSE and its runner then connects to -- and drives -- the
-// WINNER's app; when that app exits, every remaining case reports "Cannot
-// connect to inspector". The symptom is a wall of unrelated failures in a
-// suite whose own app was healthy the whole time.
+// The port for a human attaching to an app they started by hand. A suite that
+// launches its OWN app takes a free port instead, because several such suites
+// run at once -- nix builds independent checks in parallel, and one machine
+// hosts several agents -- and two apps on one fixed port do not fail loudly:
+// the loser's listen() gets EADDRINUSE and its runner then connects to, and
+// drives, the WINNER's app. Once that app exits every remaining case reports
+// "Cannot connect to inspector", so the clash surfaces as a wall of unrelated
+// failures in a suite whose own app was healthy the whole time.
 const DEFAULT_PORT = 3768;
+
 // An explicit QML_INSPECTOR_PORT is an instruction, not a default: honour it
 // verbatim (that is how the MCP server and a hand-started app find each other)
 // and never silently move off it.
 const EXPLICIT_PORT = process.env.QML_INSPECTOR_PORT
   ? parseInt(process.env.QML_INSPECTOR_PORT, 10)
   : null;
+
+// The port `new Inspector()` uses when given none of its own.
+// launchAppWithInspector() repoints it at the app it just launched.
 let PORT = EXPLICIT_PORT ?? DEFAULT_PORT;
 const TIMEOUT_MS = 15000;
-
-/** The port `new Inspector()` connects to when given no port of its own. */
-export function inspectorPort() { return PORT; }
-
-/** Point the framework's default Inspector at `port`. */
-export function setInspectorPort(port) { PORT = port; }
 
 /**
  * A port nothing is listening on, for an app this process is about to launch.
@@ -78,8 +74,7 @@ export function reserveInspectorPort() {
 // ---------------------------------------------------------------------------
 export class Inspector {
   // `port` pins this instance to one app. Omit it only when a single app is in
-  // play (setInspectorPort() has named it); two concurrent apps need two
-  // Inspectors with two explicit ports.
+  // play; two concurrent apps need two Inspectors with two explicit ports.
   constructor(port = null) {
     this.socket = null;
     this.requestId = 0;
@@ -267,7 +262,7 @@ export class App {
 // instead of the full waitForInspector timeout.
 const BIND_FAILURE_MARKER = "[QmlInspector] Failed to listen on port";
 
-async function waitForInspector(port = PORT, { maxRetries = 30, intervalMs = 500, bindFailed = null } = {}) {
+async function waitForInspector(port, { maxRetries = 30, intervalMs = 500, bindFailed = null } = {}) {
   for (let i = 0; i < maxRetries; i++) {
     if (bindFailed?.value) {
       throw new Error(`Inspector could not bind ${HOST}:${port} (port already in use)`);
@@ -288,7 +283,7 @@ async function waitForInspector(port = PORT, { maxRetries = 30, intervalMs = 500
 
 // The app reads QML_INSPECTOR_PORT itself (InspectorServer::attach), so the
 // port travels to it as an environment variable and nothing else has to agree.
-function launchOffscreen(appBin, verbose = false, port = PORT) {
+function launchOffscreen(appBin, port, verbose = false) {
   if (verbose) console.log(`Launching: ${appBin} -platform offscreen (inspector port ${port})`);
   const child = spawn(appBin, ["-platform", "offscreen"], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -303,7 +298,7 @@ function launchOffscreen(appBin, verbose = false, port = PORT) {
   return child;
 }
 
-function launchXvfb(appBin, verbose = false, port = PORT) {
+function launchXvfb(appBin, port, verbose = false) {
   if (verbose) console.log(`Launching: ${appBin} with Xvfb (inspector port ${port})`);
 
   const child = spawn(
@@ -323,8 +318,8 @@ function launchXvfb(appBin, verbose = false, port = PORT) {
   return child;
 }
 
-function launchApp(launchFn, appBin, verbose = false, port = PORT) {
-  const child = launchFn(appBin, verbose, port);
+function launchApp(launchFn, appBin, port, verbose = false) {
+  const child = launchFn(appBin, port, verbose);
   const bindFailed = { value: false };
 
   // Every chunk passes through here even when quiet: the bind-failure marker
@@ -364,26 +359,23 @@ export async function launchAppWithInspector({
   appBin, useXvfb = false, verbose = false, attempts = 3, waitOpts = {},
 } = {}) {
   const launchFn = useXvfb ? launchXvfb : launchOffscreen;
-  let lastErr = null;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const port = await reserveInspectorPort();
-    const child = launchApp(launchFn, appBin, verbose, port);
+    const child = launchApp(launchFn, appBin, port, verbose);
     try {
       await waitForInspector(port, { ...waitOpts, bindFailed: child.bindFailed });
-      setInspectorPort(port);
+      PORT = port;
       return { child, port };
     } catch (err) {
-      lastErr = err;
-      const portWasTaken = child.bindFailed.value;
+      const lostTheRace = child.bindFailed.value;
       child.kill();
-      // Only a LOST RACE is retryable. An app that bound its port and still
+      // Only a lost race is retryable. An app that bound its port and still
       // never answered is broken, and retrying it just burns the caller's
       // timeout budget three times over before saying so.
-      if (!portWasTaken || EXPLICIT_PORT !== null || attempt === attempts) throw err;
+      if (!lostTheRace || EXPLICIT_PORT !== null || attempt === attempts) throw err;
       console.error(`${err.message} — retrying on a fresh port (attempt ${attempt + 1}/${attempts})`);
     }
   }
-  throw lastErr;
 }
 
 // ---------------------------------------------------------------------------
