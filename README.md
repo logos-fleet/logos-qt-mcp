@@ -49,7 +49,10 @@ Add the inspector to your Qt app:
 InspectorServer::attach(mainWindow);  // listens on port 3768
 ```
 
-The port can be configured via the `QML_INSPECTOR_PORT` environment variable.
+The port comes from the `QML_INSPECTOR_PORT` environment variable when set;
+`0` means "any free port" (read the chosen one off the `Inspector server
+listening on port N` line). The test framework sets it per launched app — see
+[Environment variables](#environment-variables).
 
 ### What it provides
 
@@ -171,7 +174,19 @@ node tests/ui-tests.mjs --ci /path/to/logos-basecamp counter
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QML_INSPECTOR_HOST` | `localhost` | Inspector host |
-| `QML_INSPECTOR_PORT` | `3768` | Inspector port |
+| `QML_INSPECTOR_PORT` | a free port per app in `--ci` mode; `3768` otherwise | Inspector port |
+
+In `--ci` mode the framework launches the app itself, so it takes a free port,
+passes it to the app in `QML_INSPECTOR_PORT` and connects there. This is what
+lets several suites run at once — nix builds independent checks in parallel,
+and one machine hosts several agents. On a shared fixed port the second app's
+`listen()` fails with `EADDRINUSE` and its runner silently attaches to the
+*first* app instead, so the clash surfaces as unrelated assertion failures in
+whichever suite lost.
+
+Setting `QML_INSPECTOR_PORT` yourself is an instruction, not a default: the
+framework then uses exactly that port and never moves off it. That is the mode
+the MCP server and a hand-started app use to find each other.
 
 ### Test API
 

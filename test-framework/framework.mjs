@@ -18,33 +18,86 @@
 //
 // Environment:
 //   QML_INSPECTOR_HOST  (default: localhost)
-//   QML_INSPECTOR_PORT  (default: 3768)
+//   QML_INSPECTOR_PORT  (no default when the framework launches the app: it
+//                        takes a free port per app -- see below)
 // ---------------------------------------------------------------------------
 
 import net from "node:net";
 import { spawn } from "node:child_process";
 
 const HOST = process.env.QML_INSPECTOR_HOST || "localhost";
-const PORT = parseInt(process.env.QML_INSPECTOR_PORT || "3768", 10);
+
+// The inspector port is a VARIABLE, not a constant. 3768 stays the default for
+// a human attaching to an app they started by hand, but a suite that launches
+// its OWN app takes a free port instead, because several such suites run at
+// once: nix builds independent checks in parallel, and one machine hosts
+// several agents.
+//
+// Two apps on one fixed port do not fail loudly. The loser's listen() fails
+// with EADDRINUSE and its runner then connects to -- and drives -- the
+// WINNER's app; when that app exits, every remaining case reports "Cannot
+// connect to inspector". The symptom is a wall of unrelated failures in a
+// suite whose own app was healthy the whole time.
+const DEFAULT_PORT = 3768;
+// An explicit QML_INSPECTOR_PORT is an instruction, not a default: honour it
+// verbatim (that is how the MCP server and a hand-started app find each other)
+// and never silently move off it.
+const EXPLICIT_PORT = process.env.QML_INSPECTOR_PORT
+  ? parseInt(process.env.QML_INSPECTOR_PORT, 10)
+  : null;
+let PORT = EXPLICIT_PORT ?? DEFAULT_PORT;
 const TIMEOUT_MS = 15000;
+
+/** The port `new Inspector()` connects to when given no port of its own. */
+export function inspectorPort() { return PORT; }
+
+/** Point the framework's default Inspector at `port`. */
+export function setInspectorPort(port) { PORT = port; }
+
+/**
+ * A port nothing is listening on, for an app this process is about to launch.
+ * Returns QML_INSPECTOR_PORT unchanged when one is set.
+ *
+ * Reserve-then-release leaves a race window between close() here and bind()
+ * in the app; launchAppWithInspector() closes it by retrying on a fresh port.
+ */
+export function reserveInspectorPort() {
+  if (EXPLICIT_PORT !== null) return Promise.resolve(EXPLICIT_PORT);
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Qt Inspector TCP bridge (newline-delimited JSON)
 // ---------------------------------------------------------------------------
 export class Inspector {
-  constructor() {
+  // `port` pins this instance to one app. Omit it only when a single app is in
+  // play (setInspectorPort() has named it); two concurrent apps need two
+  // Inspectors with two explicit ports.
+  constructor(port = null) {
     this.socket = null;
     this.requestId = 0;
     this.pending = new Map();
     this.buffer = "";
+    this.port = port;
   }
+
+  /** The port this instance talks to. */
+  get inspectorPort() { return this.port ?? PORT; }
 
   async connect() {
     if (this.socket && !this.socket.destroyed) return;
+    const port = this.inspectorPort;
     return new Promise((resolve, reject) => {
-      const sock = net.createConnection({ host: HOST, port: PORT });
+      const sock = net.createConnection({ host: HOST, port });
       sock.once("connect", () => { this.socket = sock; resolve(); });
-      sock.once("error", (err) => reject(new Error(`Cannot connect to inspector: ${err.message}`)));
+      sock.once("error", (err) => reject(new Error(`Cannot connect to inspector on port ${port}: ${err.message}`)));
       sock.on("data", (chunk) => { this.buffer += chunk.toString("utf-8"); this._drain(); });
       sock.on("close", () => {
         this.socket = null;
@@ -209,10 +262,18 @@ export class App {
 // ---------------------------------------------------------------------------
 // CI helpers
 // ---------------------------------------------------------------------------
-async function waitForInspector(maxRetries = 30, intervalMs = 500) {
+// The message InspectorServer::start() prints when its bind() lost the race.
+// Watched for, rather than waited out, so a taken port costs milliseconds
+// instead of the full waitForInspector timeout.
+const BIND_FAILURE_MARKER = "[QmlInspector] Failed to listen on port";
+
+async function waitForInspector(port = PORT, { maxRetries = 30, intervalMs = 500, bindFailed = null } = {}) {
   for (let i = 0; i < maxRetries; i++) {
+    if (bindFailed?.value) {
+      throw new Error(`Inspector could not bind ${HOST}:${port} (port already in use)`);
+    }
     try {
-      const sock = net.createConnection({ host: HOST, port: PORT });
+      const sock = net.createConnection({ host: HOST, port });
       await new Promise((resolve, reject) => {
         sock.once("connect", () => { sock.destroy(); resolve(); });
         sock.once("error", reject);
@@ -222,25 +283,28 @@ async function waitForInspector(maxRetries = 30, intervalMs = 500) {
       await new Promise((r) => setTimeout(r, intervalMs));
     }
   }
-  throw new Error(`Inspector not available at ${HOST}:${PORT} after ${maxRetries * intervalMs}ms`);
+  throw new Error(`Inspector not available at ${HOST}:${port} after ${maxRetries * intervalMs}ms`);
 }
 
-function launchOffscreen(appBin, verbose = false) {
-  if (verbose) console.log(`Launching: ${appBin} -platform offscreen`);
+// The app reads QML_INSPECTOR_PORT itself (InspectorServer::attach), so the
+// port travels to it as an environment variable and nothing else has to agree.
+function launchOffscreen(appBin, verbose = false, port = PORT) {
+  if (verbose) console.log(`Launching: ${appBin} -platform offscreen (inspector port ${port})`);
   const child = spawn(appBin, ["-platform", "offscreen"], {
     stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       QT_QPA_PLATFORM: "offscreen",
       QT_FORCE_STDERR_LOGGING: "1",
+      QML_INSPECTOR_PORT: String(port),
     },
   });
 
   return child;
 }
 
-function launchXvfb(appBin, verbose = false) {
-  if (verbose) console.log(`Launching: ${appBin} with Xvfb`);
+function launchXvfb(appBin, verbose = false, port = PORT) {
+  if (verbose) console.log(`Launching: ${appBin} with Xvfb (inspector port ${port})`);
 
   const child = spawn(
     "xvfb-run",
@@ -251,6 +315,7 @@ function launchXvfb(appBin, verbose = false) {
         ...process.env,
         QT_QPA_PLATFORM: "xcb",
         QT_FORCE_STDERR_LOGGING: "1",
+        QML_INSPECTOR_PORT: String(port),
       },
     }
   );
@@ -258,16 +323,21 @@ function launchXvfb(appBin, verbose = false) {
   return child;
 }
 
-function launchApp(launchFn, appBin, verbose = false) {
-  const child = launchFn(appBin, verbose);
+function launchApp(launchFn, appBin, verbose = false, port = PORT) {
+  const child = launchFn(appBin, verbose, port);
+  const bindFailed = { value: false };
 
-  if (verbose) {
-    child.stdout.on("data", (d) => process.stderr.write(`[app:out] ${d}`));
-    child.stderr.on("data", (d) => process.stderr.write(`[app:err] ${d}`));
-  } else {
-    child.stdout.resume();
-    child.stderr.resume();
-  }
+  // Every chunk passes through here even when quiet: the bind-failure marker
+  // has to be seen, and child.stdout.resume() would throw it away.
+  const tap = (stream, label) => {
+    stream.on("data", (d) => {
+      const text = d.toString();
+      if (text.includes(BIND_FAILURE_MARKER)) bindFailed.value = true;
+      if (verbose) process.stderr.write(`[app:${label}] ${text}`);
+    });
+  };
+  tap(child.stdout, "out");
+  tap(child.stderr, "err");
 
   child.on("exit", (code) => {
     if (code !== null && code !== 0) {
@@ -275,7 +345,45 @@ function launchApp(launchFn, appBin, verbose = false) {
     }
   });
 
+  child.bindFailed = bindFailed;
   return child;
+}
+
+/**
+ * Launch `appBin` on an inspector port of its own and wait until that
+ * inspector answers. Returns { child, port }.
+ *
+ * Retries on a fresh port when the app loses the reserve/bind race with
+ * another process, which is the whole point: the caller gets an app it is
+ * certain is the one it launched, never a neighbour's.
+ *
+ * With QML_INSPECTOR_PORT set there is nothing to retry onto, so a failure
+ * there is reported as-is.
+ */
+export async function launchAppWithInspector({
+  appBin, useXvfb = false, verbose = false, attempts = 3, waitOpts = {},
+} = {}) {
+  const launchFn = useXvfb ? launchXvfb : launchOffscreen;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const port = await reserveInspectorPort();
+    const child = launchApp(launchFn, appBin, verbose, port);
+    try {
+      await waitForInspector(port, { ...waitOpts, bindFailed: child.bindFailed });
+      setInspectorPort(port);
+      return { child, port };
+    } catch (err) {
+      lastErr = err;
+      const portWasTaken = child.bindFailed.value;
+      child.kill();
+      // Only a LOST RACE is retryable. An app that bound its port and still
+      // never answered is broken, and retrying it just burns the caller's
+      // timeout budget three times over before saying so.
+      if (!portWasTaken || EXPLICIT_PORT !== null || attempt === attempts) throw err;
+      console.error(`${err.message} — retrying on a fresh port (attempt ${attempt + 1}/${attempts})`);
+    }
+  }
+  throw lastErr;
 }
 
 // ---------------------------------------------------------------------------
@@ -363,17 +471,15 @@ export async function run() {
     const filter = args[1] || "";
     const useXvfb = rawArgs.includes("--xvfb");
 
-    const appProcess = launchApp(useXvfb ? launchXvfb : launchOffscreen, appBin, verbose);
-
-    if (verbose) console.log("Waiting for inspector to become available...");
+    if (verbose) console.log("Launching the app and waiting for its inspector...");
+    let appProcess;
     try {
-      await waitForInspector();
+      ({ child: appProcess } = await launchAppWithInspector({ appBin, useXvfb, verbose }));
     } catch (err) {
       console.error(err.message);
-      appProcess.kill();
       process.exit(1);
     }
-    if (verbose) console.log("Inspector connected.");
+    if (verbose) console.log(`Inspector connected on port ${PORT}.`);
 
     // Give the app a moment to fully initialize plugins
     await new Promise((r) => setTimeout(r, 2000));
